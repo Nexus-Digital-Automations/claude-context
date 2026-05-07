@@ -318,9 +318,9 @@ Environment Variables:
   OLLAMA_HOST             Ollama server host (default: http://127.0.0.1:11434)
   OLLAMA_MODEL            Ollama model name (alternative to EMBEDDING_MODEL for Ollama).
                           Recommended for code+text retrieval:
-                            jina/jina-embeddings-v2-base-code  (768 dim, code-tuned)
-                            mxbai-embed-large                  (1024 dim, prose-focused)
-                            nomic-embed-text                   (768 dim, fast default)
+                            bge-m3              (1024 dim, BAAI code+text, ~1.2 GB)
+                            mxbai-embed-large   (1024 dim, prose-focused, ~670 MB)
+                            nomic-embed-text    (768 dim, fast default, ~270 MB)
                           Switching the model requires a full re-index — use the
                           'resync_index' MCP tool after changing OLLAMA_MODEL.
   

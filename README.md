@@ -488,20 +488,20 @@ To configure custom embedding models (e.g., `text-embedding-3-large` for OpenAI,
 
 #### Recommended Ollama models (free, local)
 
-Choice of embedder is the single biggest lever on retrieval quality — far bigger than any boost rule. If you're on Ollama, these are the trade-offs:
+Choice of embedder is the single biggest lever on retrieval quality — far bigger than any boost rule. If you're on Ollama, these are the trade-offs (all Apache 2.0 / similarly permissive, all in Ollama's main library):
 
 | Model | Dim | Best for | Notes |
 |---|---|---|---|
-| `jina-embeddings-v2-base-code` | 768 | Code + text retrieval (recommended) | Trained jointly on natural language and 30+ programming languages. Strong on plan-intent queries that mix prose and code. |
-| `mxbai-embed-large` | 1024 | General natural language | Stronger than `nomic-embed-text` on prose; weaker than `jina-...-code` for source code. |
-| `nomic-embed-text` | 768 | Fast/light default | Upstream default. Tends to favour code identifiers over prose for plan-shaped queries. |
+| `bge-m3` | 1024 | Code + text retrieval (recommended) | BAAI's flagship multilingual + code embedder, ~1.2 GB. Strong on plan-intent queries that mix prose and code; benchmarks well on both retrieval families. |
+| `mxbai-embed-large` | 1024 | General natural language | Mixedbread, ~670 MB. Stronger than `nomic-embed-text` on prose; weaker than `bge-m3` for source code. |
+| `nomic-embed-text` | 768 | Fast/light default | Upstream default, ~270 MB. Tends to favour code identifiers over prose for plan-shaped queries. |
 
 ```bash
 # Pull and switch:
-ollama pull jina/jina-embeddings-v2-base-code
+ollama pull bge-m3
 # Update env (e.g. in ~/.claude.json mcpServers entry):
 EMBEDDING_PROVIDER=Ollama
-OLLAMA_MODEL=jina/jina-embeddings-v2-base-code
+OLLAMA_MODEL=bge-m3
 ```
 
 **Switching the model requires a full re-index** because Milvus collections are dimension-fixed. Use the `resync_index` MCP tool after changing the model:

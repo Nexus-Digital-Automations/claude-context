@@ -1,0 +1,60 @@
+# Security-scan suppressions for false positives, file-specific.
+# Each suppression has a preceding `# why:` line documenting the audit.
+# To re-audit, run the security scan and compare the new findings against
+# this list — only specific files appearing in the prior 1012-finding run
+# are listed here.
+
+# why: pnpm lockfile contains base64-encoded SHA256 integrity hashes for
+# every package version (the `integrity:` field). detect-secrets flags
+# these as high-entropy strings but they are content checksums, not
+# credentials. 996/1012 findings in the prior scan came from this file.
+pnpm-lock.yaml
+
+# why: detect-secrets flagged 4 lines in the upstream .gitignore as
+# high-entropy. Inspecting the file, those lines are common ignore patterns
+# (e.g. `*.tsbuildinfo`, lockfile globs); no credentials. Upstream artifact,
+# not authored by this fork.
+.gitignore
+
+# why: contains illustrative env-var values like `OPENAI_API_KEY=sk-xxx`,
+# `MILVUS_TOKEN=your-token` for users to replace. detect-secrets cannot
+# distinguish placeholder strings from real keys; the user-replacement
+# pattern is established convention for tutorial docs.
+README.md
+
+# why: same placeholder-env-var pattern as README.md; quick-start guide
+# tells users how to set their own keys, not real keys.
+docs/getting-started/quick-start.md
+
+# why: MCP package README documents `OPENAI_API_KEY=sk-xxx` placeholder
+# usage; not a real key.
+packages/mcp/README.md
+
+# why: contributor doc with placeholder env values for local-dev setup.
+packages/mcp/CONTRIBUTING.md
+
+# why: example code reads env vars and shows a placeholder default for
+# documentation purposes; not a hardcoded real key.
+examples/basic-usage/index.ts
+
+# why: example README describes the same placeholder-env pattern as the
+# main README.
+examples/basic-usage/README.md
+
+# why: Python-subproject README documents placeholder env values; not a
+# real key.
+python/README.md
+
+# why: end-to-end test fixture uses a deliberately-fake API key string
+# to exercise the auth code path; never sent to a real provider.
+python/test_endtoend.py
+
+# why: Gemini embedding test fixture uses a deliberately-fake key string
+# to test config wiring; not a real credential.
+packages/core/src/embedding/gemini-embedding.test.ts
+
+# why: chrome extension's options.html contains a placeholder attribute
+# (e.g. `placeholder="sk-..."`) on a form input — the literal string is
+# UI guidance, not a hardcoded credential. Upstream package, out of scope
+# for this fork.
+packages/chrome-extension/src/options.html
