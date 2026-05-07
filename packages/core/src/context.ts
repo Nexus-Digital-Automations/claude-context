@@ -35,6 +35,44 @@ export class IndexAbortError extends Error {
     }
 }
 
+/**
+ * Hard cap on chunks indexed per codebase. When `processFileList` accumulates
+ * this many chunks it stops and returns `status: 'limit_reached'` — remaining
+ * files are NOT processed and the snapshot reflects a partial index. Exposed
+ * so the MCP `get_indexing_status` tool can surface the cap to agents (P7).
+ * @stable — external observability depends on this being readable.
+ */
+export const CHUNK_LIMIT = 450000;
+
+/**
+ * Default RRF rank-fusion constant for hybrid search. The RRF score for a
+ * result at rank `r` is `1 / (k + r)`, so smaller `k` produces wider score
+ * deltas between adjacent ranks. With k=60 (Milvus's canonical default),
+ * rank-1 ≈ 0.0164 vs rank-10 ≈ 0.0143 — about 65% wider than k=100, giving
+ * downstream score-multiplicative reranking (boosts) genuine leverage.
+ * Override per-process via the `CLAUDE_CONTEXT_RRF_K` env var.
+ * @stable — exposed alongside CHUNK_LIMIT for observability symmetry.
+ */
+export const RRF_K_DEFAULT = 60;
+
+/**
+ * Resolve the active RRF k from `CLAUDE_CONTEXT_RRF_K` with bounded fallback.
+ * Returns RRF_K_DEFAULT for unset/non-integer/non-positive values; logs a
+ * warning on rejection so misconfiguration is visible without crashing the
+ * search path. Counterpart: read site is semanticSearch in this file.
+ * @internal
+ */
+function readRrfKFromEnv(): number {
+    const raw = envManager.get('CLAUDE_CONTEXT_RRF_K');
+    if (!raw) return RRF_K_DEFAULT;
+    const parsed = Number(raw);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+        console.warn(`[Context] ⚠️  Ignoring invalid CLAUDE_CONTEXT_RRF_K='${raw}' — expected positive integer. Falling back to default ${RRF_K_DEFAULT}.`);
+        return RRF_K_DEFAULT;
+    }
+    return parsed;
+}
+
 const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
     '.ts', '.tsx', '.js', '.jsx', '.py', '.java', '.cpp', '.c', '.h', '.hpp',
@@ -560,14 +598,18 @@ export class Context {
             console.log(`[Context] 🔍 Search request 2 (sparse): anns_field="${searchRequests[1].anns_field}", query_text="${query}", limit=${searchRequests[1].limit}`);
 
             // 3. Execute hybrid search
-            console.log(`[Context] 🔍 Executing hybrid search with RRF reranking...`);
+            // RRF k controls the rank-fusion score curve (`1 / (k + rank)`).
+            // Smaller k spreads scores between adjacent ranks, which is what
+            // gives multiplicative boosts (P4/P5) genuine leverage.
+            const rrfK = readRrfKFromEnv();
+            console.log(`[Context] 🔍 Executing hybrid search with RRF reranking (k=${rrfK})...`);
             const searchResults: HybridSearchResult[] = await this.vectorDatabase.hybridSearch(
                 collectionName,
                 searchRequests,
                 {
                     rerank: {
                         strategy: 'rrf',
-                        params: { k: 100 }
+                        params: { k: rrfK }
                     },
                     limit: topK,
                     filterExpr
@@ -837,7 +879,6 @@ export class Context {
     ): Promise<{ processedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const EMBEDDING_BATCH_SIZE = Math.max(1, parseInt(envManager.get('EMBEDDING_BATCH_SIZE') || '100', 10));
-        const CHUNK_LIMIT = 450000;
         console.log(`[Context] 🔧 Using EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE}`);
 
         let chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }> = [];

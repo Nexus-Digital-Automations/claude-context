@@ -75,7 +75,7 @@ class ContextMcpServer {
         // Initialize managers
         this.snapshotManager = new SnapshotManager();
         this.syncManager = new SyncManager(this.context, this.snapshotManager);
-        this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager);
+        this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager, config.boostDefaults);
 
         // Load existing codebase snapshot on startup
         this.snapshotManager.loadCodebaseSnapshot();
@@ -112,9 +112,19 @@ This tool is versatile and can be used before completing various tasks to retrie
 - **Feature development**: Understand existing architecture and similar implementations
 - **Duplicate detection**: Identify redundant or duplicated code patterns across the codebase
 
+🎚️ **Granular Control**:
+- **Path subscope**: passing a path that is a strict descendant of an indexed root (e.g. \`path=/repo/plans\` when \`/repo\` is indexed) restricts results to that subtree via a server-side filter — results from siblings are excluded, not just routed.
+- **Per-call ranking boosts** (\`boosts\` arg): multiplicatively reweight RRF scores AFTER vector search.
+  - \`boosts.folders\`: longest-prefix match on \`relativePath\` (e.g. \`{"plans/": 1.5, "tests/fixtures/": 0.5}\`).
+  - \`boosts.extensions\`: exact extname match (e.g. \`{".md": 1.2, ".py": 0.9}\`).
+  - Folder + extension compose multiplicatively. Default is 1.0 (no-op). Per-call entries win over server-side defaults from the \`CLAUDE_CONTEXT_BOOSTS\` env var on key collision.
+  - Use boosts to surface plan/spec markdown over implementation files for intent queries, or to demote test fixtures.
+- **Server-side defaults**: \`CLAUDE_CONTEXT_BOOSTS=folder:plans/=1.5,ext:.md=1.2\` sets baseline weights without requiring per-call args.
+
 ✨ **Usage Guidance**:
 - If the codebase is not indexed, this tool will return a clear error message indicating that indexing is required first.
 - You can then use the index_codebase tool to index the codebase before searching again.
+- When boosts are applied, each result's output includes a \`Boost: ×N.NN (rrf=... → adj=...)\` line for transparency.
 `;
 
         // Define available tools
@@ -189,6 +199,28 @@ This tool is versatile and can be used before completing various tasks to retrie
                                     },
                                     description: "Optional: List of file extensions to filter results. (e.g., ['.ts','.py']).",
                                     default: []
+                                },
+                                profile: {
+                                    type: "string",
+                                    enum: ["plan", "code", "doc", "mixed"],
+                                    description: "Optional: ranking profile preset. Each preset bundles known-good boosts for a common query intent. Layers UNDER per-call `boosts` (per-call wins) and OVER server-side `CLAUDE_CONTEXT_BOOSTS` env defaults. Presets:\n- 'plan' — surfaces planning/spec markdown over implementation code (plans/=2.0, specs/=1.5, docs/=1.3, .md=1.3, .py/.ts/.js=0.8). Use for 'did we plan/spec X?' queries.\n- 'code' — favours source code, demotes test fixtures (src/=1.3, lib/=1.2, tests/fixtures/=0.5, .md=0.7). Use for implementation-finding queries.\n- 'doc' — favours documentation (docs/=1.5, plans/=1.3, .md=1.5, .txt=1.3). Use for 'how do I configure/use X?' queries.\n- 'mixed' — identity (no boosts from profile). Use to opt out without removing the arg."
+                                },
+                                boosts: {
+                                    type: "object",
+                                    description: "Optional: Multiplicative score boosts applied AFTER RRF ranking, used to re-sort results. Server-side defaults from CLAUDE_CONTEXT_BOOSTS env var are merged in (per-call entries win on key collision). Both maps are optional; default per dimension is 1.0.",
+                                    properties: {
+                                        folders: {
+                                            type: "object",
+                                            description: "Per-folder weights keyed by relativePath prefix (e.g. {'plans/': 1.5, 'tests/fixtures/': 0.5}). Longest matching prefix wins.",
+                                            additionalProperties: { type: "number" }
+                                        },
+                                        extensions: {
+                                            type: "object",
+                                            description: "Per-extension weights keyed by extname including the dot (e.g. {'.md': 1.2, '.py': 0.9}).",
+                                            additionalProperties: { type: "number" }
+                                        }
+                                    },
+                                    additionalProperties: false
                                 }
                             },
                             required: ["path", "query"]
@@ -209,8 +241,40 @@ This tool is versatile and can be used before completing various tasks to retrie
                         }
                     },
                     {
+                        name: "boost_stats",
+                        description: `Summarize boost telemetry from ~/.context/boost-events.jsonl. Reports total boost-applied searches, per-rule fire counts (which folder/extension boosts actually matched results), rank-shift rate (% of queries where boosts changed the rank-1 result), and top boosted result paths. Use this to tune profile presets and CLAUDE_CONTEXT_BOOSTS env defaults based on real query patterns. Returns 'no events recorded' when telemetry is empty.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {},
+                            required: []
+                        }
+                    },
+                    {
+                        name: "resync_index",
+                        description: `Resync a codebase's index when get_indexing_status reports a stale snapshot (live Milvus chunk count differs from the snapshot's stored count). Composes clear_index + index_codebase(force=true) atomically. Cancels in-flight indexing before resyncing. Use this instead of running clear_index and index_codebase separately when the staleness warning fires.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                path: {
+                                    type: "string",
+                                    description: `ABSOLUTE path to the codebase directory to resync.`
+                                }
+                            },
+                            required: ["path"]
+                        }
+                    },
+                    {
                         name: "get_indexing_status",
-                        description: `Get the current indexing status of a codebase. Shows progress percentage for actively indexing codebases and completion status for indexed codebases.`,
+                        description: `Get the current indexing status of a codebase. Shows progress percentage for actively indexing codebases and completion status for indexed codebases.
+
+Also returns a 📊 Diagnostics block with:
+- chunkLimit: hard cap on chunks per codebase (450000)
+- liveChunkCount: live row count from Milvus (vs. snapshot's stored counts) — call this out as 'unavailable' if the vector DB is unreachable
+- stale-snapshot warning: auto-fires when liveChunkCount differs from the snapshot's totalChunks (signals the snapshot is out of sync; clear_index + index_codebase will resync)
+- capFired: yes/no — whether indexing was truncated by chunkLimit
+- fileWatcherEnabled, backgroundSyncEnabled, backgroundSyncIntervalMs: current sync configuration
+
+Use this to diagnose stale snapshots before re-indexing.`,
                         inputSchema: {
                             type: "object",
                             properties: {
@@ -237,6 +301,10 @@ This tool is versatile and can be used before completing various tasks to retrie
                     return await this.toolHandlers.handleSearchCode(args);
                 case "clear_index":
                     return await this.toolHandlers.handleClearIndex(args);
+                case "resync_index":
+                    return await this.toolHandlers.handleResyncIndex(args);
+                case "boost_stats":
+                    return await this.toolHandlers.handleBoostStats(args);
                 case "get_indexing_status":
                     return await this.toolHandlers.handleGetIndexingStatus(args);
 

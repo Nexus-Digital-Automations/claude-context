@@ -1,5 +1,19 @@
 import { envManager } from "@zilliz/claude-context-core";
 
+/**
+ * Multiplicative score boosts applied to RRF results before re-sorting.
+ * `folders`: longest-prefix match on result `relativePath` (e.g. "plans/" → 1.5).
+ * `extensions`: exact match on `path.extname(relativePath)` (e.g. ".md" → 1.2).
+ * Both compose multiplicatively when both fire. Default per dimension is 1.0.
+ * Counterpart: applied in handlers.ts after Context.semanticSearch returns —
+ * Milvus's RRF ranking is left intact.
+ * @stable — exposed via the `boosts` arg on the search_code MCP tool.
+ */
+export interface BoostRules {
+    folders?: Record<string, number>;
+    extensions?: Record<string, number>;
+}
+
 export interface ContextMcpConfig {
     name: string;
     version: string;
@@ -22,6 +36,8 @@ export interface ContextMcpConfig {
     milvusAddress?: string; // Optional, can be auto-resolved from token
     milvusToken?: string;
     collectionNameOverride?: string;
+    // Server-side default ranking boosts (overridden per-call by `boosts` arg).
+    boostDefaults?: BoostRules;
 }
 
 // Legacy format (v1) - for backward compatibility
@@ -133,6 +149,60 @@ function getPositiveIntegerFromEnv(name: string): number | undefined {
     return undefined;
 }
 
+/**
+ * Parse `CLAUDE_CONTEXT_BOOSTS` into a {@link BoostRules} object.
+ * Format: comma-separated `kind:key=weight` entries. `kind` is `folder` or
+ * `ext`; weight is a positive finite number. Examples:
+ *   `folder:plans/=1.5,folder:tests/fixtures/=0.5,ext:.md=1.2,ext:.py=0.9`
+ * Malformed entries are logged and dropped — server still starts.
+ * Returns undefined when the env var is unset or yields zero valid rules.
+ * @internal — counterpart: validateBoosts in handlers.ts mirrors per-call validation.
+ */
+export function parseBoostRulesFromEnv(): BoostRules | undefined {
+    const raw = envManager.get('CLAUDE_CONTEXT_BOOSTS');
+    if (!raw) return undefined;
+
+    const folders: Record<string, number> = {};
+    const extensions: Record<string, number> = {};
+    const entryPattern = /^(folder|ext):(.+?)=([^=]+)$/;
+
+    for (const entry of raw.split(',')) {
+        const trimmed = entry.trim();
+        if (!trimmed) continue;
+        const parts = trimmed.match(entryPattern);
+        if (!parts) {
+            console.warn(`[DEBUG] ⚠️  Ignoring malformed CLAUDE_CONTEXT_BOOSTS entry: '${trimmed}'. Expected 'folder:<path>/=<weight>' or 'ext:.<ext>=<weight>'.`);
+            continue;
+        }
+        const kind = parts[1];
+        const key = parts[2];
+        const weight = Number(parts[3]);
+        if (!Number.isFinite(weight) || weight <= 0) {
+            console.warn(`[DEBUG] ⚠️  Ignoring CLAUDE_CONTEXT_BOOSTS entry with non-positive weight: '${trimmed}'.`);
+            continue;
+        }
+        if (kind === 'folder') {
+            const normalized = key.endsWith('/') ? key : `${key}/`;
+            folders[normalized] = weight;
+        } else {
+            if (!key.startsWith('.') || key.length < 2) {
+                console.warn(`[DEBUG] ⚠️  Ignoring CLAUDE_CONTEXT_BOOSTS extension entry without leading dot: '${trimmed}'.`);
+                continue;
+            }
+            extensions[key] = weight;
+        }
+    }
+
+    const folderCount = Object.keys(folders).length;
+    const extCount = Object.keys(extensions).length;
+    if (folderCount === 0 && extCount === 0) return undefined;
+    console.log(`[DEBUG] 🎚️  Parsed CLAUDE_CONTEXT_BOOSTS: ${folderCount} folder rule(s), ${extCount} extension rule(s)`);
+    return {
+        ...(folderCount > 0 && { folders }),
+        ...(extCount > 0 && { extensions })
+    };
+}
+
 export function createMcpConfig(): ContextMcpConfig {
     // Debug: Print all environment variables related to Context
     console.log(`[DEBUG] 🔍 Environment Variables Debug:`);
@@ -167,7 +237,8 @@ export function createMcpConfig(): ContextMcpConfig {
         // Vector database configuration - address can be auto-resolved from token
         milvusAddress: envManager.get('MILVUS_ADDRESS'), // Optional, can be resolved from token
         milvusToken: envManager.get('MILVUS_TOKEN'),
-        collectionNameOverride: envManager.get('CODE_CHUNKS_COLLECTION_NAME_OVERRIDE')
+        collectionNameOverride: envManager.get('CODE_CHUNKS_COLLECTION_NAME_OVERRIDE'),
+        boostDefaults: parseBoostRulesFromEnv()
     };
 
     return config;
@@ -245,7 +316,13 @@ Environment Variables:
 
   Ollama Configuration:
   OLLAMA_HOST             Ollama server host (default: http://127.0.0.1:11434)
-  OLLAMA_MODEL            Ollama model name (alternative to EMBEDDING_MODEL for Ollama)
+  OLLAMA_MODEL            Ollama model name (alternative to EMBEDDING_MODEL for Ollama).
+                          Recommended for code+text retrieval:
+                            jina/jina-embeddings-v2-base-code  (768 dim, code-tuned)
+                            mxbai-embed-large                  (1024 dim, prose-focused)
+                            nomic-embed-text                   (768 dim, fast default)
+                          Switching the model requires a full re-index — use the
+                          'resync_index' MCP tool after changing OLLAMA_MODEL.
   
   Vector Database Configuration:
   MILVUS_ADDRESS          Milvus address (optional, can be auto-resolved from token)
@@ -275,6 +352,24 @@ Environment Variables:
                           lock as background sync, so multi-instance setups stay
                           coordinated. Set to false to disable filesystem
                           watching entirely (read-only / sandboxed environments).
+
+  Ranking Boosts:
+  CLAUDE_CONTEXT_BOOSTS   Server-side default ranking boosts applied to RRF
+                          scores AFTER vector search. Format: comma-separated
+                          'kind:key=weight' entries. kind is 'folder' or 'ext';
+                          weight is a positive finite number.
+                          Folder match uses longest-prefix on relativePath;
+                          extension match uses exact extname. Per-call boosts
+                          arg on search_code wins over these defaults on key
+                          collision. Malformed entries are logged and dropped.
+                          Example:
+                            CLAUDE_CONTEXT_BOOSTS=folder:plans/=1.5,folder:tests/fixtures/=0.5,ext:.md=1.2,ext:.py=0.9
+
+  CLAUDE_CONTEXT_RRF_K    RRF rank-fusion constant for hybrid search. Score is
+                          1 / (k + rank), so smaller k spreads scores between
+                          adjacent ranks and gives boosts more leverage.
+                          Default: 60. Invalid values (non-integer, <= 0) log a
+                          warning and fall back to the default.
 
 Examples:
   # Start MCP server with OpenAI (default) and explicit Milvus address

@@ -486,6 +486,32 @@ For more detailed MCP environment variable configuration, see our [Environment V
 
 To configure custom embedding models (e.g., `text-embedding-3-large` for OpenAI, `voyage-code-3` for VoyageAI), see the [MCP Configuration Examples](packages/mcp/README.md#embedding-provider-configuration) for detailed setup instructions for each provider.
 
+#### Recommended Ollama models (free, local)
+
+Choice of embedder is the single biggest lever on retrieval quality — far bigger than any boost rule. If you're on Ollama, these are the trade-offs:
+
+| Model | Dim | Best for | Notes |
+|---|---|---|---|
+| `jina-embeddings-v2-base-code` | 768 | Code + text retrieval (recommended) | Trained jointly on natural language and 30+ programming languages. Strong on plan-intent queries that mix prose and code. |
+| `mxbai-embed-large` | 1024 | General natural language | Stronger than `nomic-embed-text` on prose; weaker than `jina-...-code` for source code. |
+| `nomic-embed-text` | 768 | Fast/light default | Upstream default. Tends to favour code identifiers over prose for plan-shaped queries. |
+
+```bash
+# Pull and switch:
+ollama pull jina/jina-embeddings-v2-base-code
+# Update env (e.g. in ~/.claude.json mcpServers entry):
+EMBEDDING_PROVIDER=Ollama
+OLLAMA_MODEL=jina/jina-embeddings-v2-base-code
+```
+
+**Switching the model requires a full re-index** because Milvus collections are dimension-fixed. Use the `resync_index` MCP tool after changing the model:
+
+```
+resync_index path=/abs/path/to/codebase
+```
+
+For models with non-default vector dimensions, set `EMBEDDING_DIMENSION` to override.
+
 ### File Inclusion & Exclusion Rules
 
 For detailed explanation of file inclusion and exclusion rules, and how to customize them, see our [File Inclusion & Exclusion Rules](docs/dive-deep/file-inclusion-rules.md).
@@ -500,6 +526,13 @@ Index a codebase directory for hybrid search (BM25 + dense vector).
 
 Search the indexed codebase using natural language queries with hybrid search (BM25 + dense vector).
 
+Args:
+- `path` (required, absolute) — when this path is a strict descendant of an indexed root, results are restricted to that subtree via a server-side `relativePath like "<scope>/%"` filter. Sibling subdirs are excluded, not just routed.
+- `query` (required) — natural-language query string.
+- `limit` (default 10, max 50) — maximum results.
+- `extensionFilter` (optional, e.g. `[".ts", ".py"]`) — restrict to listed file extensions.
+- `boosts` (optional) — multiplicative score reweighting applied AFTER RRF; see [Granular Control](#granular-control) below.
+
 #### 3. `clear_index`
 
 Clear the search index for a specific codebase.
@@ -507,6 +540,46 @@ Clear the search index for a specific codebase.
 #### 4. `get_indexing_status`
 
 Get the current indexing status of a codebase. Shows progress percentage for actively indexing codebases and completion status for indexed codebases.
+
+The response includes a `📊 Diagnostics:` block with:
+
+- `chunkLimit` — hard cap on chunks per codebase (currently 450000).
+- `liveChunkCount` — live row count queried directly from Milvus (or `unavailable` if the vector DB is unreachable).
+- A stale-snapshot warning when `liveChunkCount` differs from the snapshot's `totalChunks`.
+- `capFired` — whether indexing was truncated by `chunkLimit`.
+- `fileWatcherEnabled`, `backgroundSyncEnabled`, `backgroundSyncIntervalMs` — current sync configuration.
+
+Use this to diagnose stale snapshots before re-indexing. If `liveChunkCount` doesn't match the snapshot, run `clear_index` then `index_codebase` to resync.
+
+### Granular Control
+
+Three levers to shape what the agent sees:
+
+**Path subscope (`search_code`)** — Pass a path that is a strict descendant of an indexed root to scope results to that subtree. Example: with `/repo` indexed, `path=/repo/plans query="..."` returns only hits under `plans/`. Results from `/repo/hooks/`, `/repo/src/` are excluded server-side.
+
+**Per-call ranking boosts (`search_code`)** — Multiplicatively reweight RRF scores after vector search. RRF stays pure; only the final ordering is reshaped.
+
+```json
+{
+  "path": "/repo",
+  "query": "did we plan a batch-edit tool?",
+  "boosts": {
+    "folders":    { "plans/": 1.5, "specs/": 1.3, "tests/fixtures/": 0.5 },
+    "extensions": { ".md": 1.2, ".py": 0.9 }
+  }
+}
+```
+
+- Folder match uses longest-prefix on `relativePath`; extension match uses exact `extname`. Both compose multiplicatively. Default per dimension is 1.0 (no-op).
+- When boosts apply, each result's output includes a `Boost: ×N.NN (rrf=... → adj=...)` line so the agent can see the rerank.
+
+**Server-side default boosts (`CLAUDE_CONTEXT_BOOSTS` env)** — Set baseline weights without per-call args. Per-call entries win on key collision.
+
+```bash
+CLAUDE_CONTEXT_BOOSTS=folder:plans/=1.5,folder:tests/fixtures/=0.5,ext:.md=1.2,ext:.py=0.9
+```
+
+Format is comma-separated `kind:key=weight`. `kind` is `folder` or `ext`; `weight` is a positive finite number. Malformed entries are logged and dropped — the server still starts.
 
 ---
 

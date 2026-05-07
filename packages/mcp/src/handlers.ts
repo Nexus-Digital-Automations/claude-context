@@ -1,11 +1,184 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError } from "@zilliz/claude-context-core";
+import { CHUNK_LIMIT, Context, COLLECTION_LIMIT_MESSAGE, envManager, FileSynchronizer, IndexAbortError } from "@zilliz/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
-import type { CodebaseIndexOptions, RequestSplitterType } from "./config.js";
+import type { BoostRules, CodebaseIndexOptions, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
 import { ensureAbsolutePath, truncateContent, trackCodebasePath } from "./utils.js";
+import { appendBoostEvent, summarizeBoostEvents } from "./boost-log.js";
+
+/**
+ * If `requestedPath` is a strict descendant of `indexedRoot`, return the
+ * POSIX-normalized relative subdirectory (e.g. "plans" or "src/core").
+ * Returns undefined when paths are equal or `requestedPath` escapes the root —
+ * callers MUST treat undefined as "no scope filter" and fall back to the full
+ * collection. Counterpart: indexer writes POSIX `relativePath` into Milvus, so
+ * the returned scope is safe to compose into a `like "<scope>/%"` predicate.
+ * @internal
+ */
+function computePathScope(indexedRoot: string, requestedPath: string): string | undefined {
+    if (indexedRoot === requestedPath) return undefined;
+    const rel = path.relative(indexedRoot, requestedPath);
+    if (!rel || rel.startsWith('..')) return undefined;
+    return rel.split(path.sep).join('/');
+}
+
+/**
+ * Escape Milvus LIKE wildcards (`%`, `_`) and the escape char itself in a
+ * literal path segment so it matches verbatim. Without this, a folder named
+ * `my_folder` would over-match `myXfolder` because `_` is a single-char
+ * wildcard in Milvus boolean expressions. Milvus uses `\` as the escape prefix.
+ * Cross-reference: https://milvus.io/docs/boolean.md
+ * @internal
+ */
+function escapeMilvusLike(literal: string): string {
+    return literal.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+
+/**
+ * Validate a per-call `boosts` arg from the MCP search_code tool. Returns a
+ * normalized {@link BoostRules} (folder keys forced to trailing slash, weights
+ * coerced to number). Returns undefined when the arg is unset/invalid; the
+ * server must NOT throw on bad input — it logs and falls through to defaults.
+ * Counterpart: parseBoostRulesFromEnv in config.ts mirrors this for env input.
+ * @internal
+ */
+function validateBoostsArg(raw: unknown): BoostRules | undefined {
+    if (!raw || typeof raw !== 'object') return undefined;
+    const input = raw as { folders?: unknown; extensions?: unknown };
+    const folders: Record<string, number> = {};
+    const extensions: Record<string, number> = {};
+
+    if (input.folders && typeof input.folders === 'object') {
+        for (const [key, value] of Object.entries(input.folders as Record<string, unknown>)) {
+            const weight = Number(value);
+            if (!Number.isFinite(weight) || weight <= 0) {
+                console.warn(`[SEARCH] ⚠️  Ignoring boost folder '${key}': non-positive weight ${value}`);
+                continue;
+            }
+            const normalized = key.endsWith('/') ? key : `${key}/`;
+            folders[normalized] = weight;
+        }
+    }
+    if (input.extensions && typeof input.extensions === 'object') {
+        for (const [key, value] of Object.entries(input.extensions as Record<string, unknown>)) {
+            const weight = Number(value);
+            if (!Number.isFinite(weight) || weight <= 0) {
+                console.warn(`[SEARCH] ⚠️  Ignoring boost extension '${key}': non-positive weight ${value}`);
+                continue;
+            }
+            if (!key.startsWith('.') || key.length < 2) {
+                console.warn(`[SEARCH] ⚠️  Ignoring boost extension '${key}': missing leading dot`);
+                continue;
+            }
+            extensions[key] = weight;
+        }
+    }
+
+    const folderCount = Object.keys(folders).length;
+    const extCount = Object.keys(extensions).length;
+    if (folderCount === 0 && extCount === 0) return undefined;
+    return {
+        ...(folderCount > 0 && { folders }),
+        ...(extCount > 0 && { extensions })
+    };
+}
+
+/**
+ * Preset boost profiles exposed via the `profile` arg on `search_code`.
+ * Each preset is a known-good {@link BoostRules} for a common query intent.
+ * Layered under per-call `boosts` (per-call wins) and over the server-side
+ * `CLAUDE_CONTEXT_BOOSTS` env defaults — see {@link mergeBoostRules}.
+ * EXTENSION POINT — add new presets here and document them in the schema in
+ * `index.ts` and the README "Granular Control" section.
+ * @stable — keys are part of the MCP tool surface.
+ */
+const BOOST_PROFILES: Record<string, BoostRules> = {
+    plan: {
+        folders: { 'plans/': 2.0, 'specs/': 1.5, 'docs/': 1.3 },
+        extensions: { '.md': 1.3, '.py': 0.8, '.ts': 0.8, '.js': 0.8 }
+    },
+    code: {
+        folders: { 'src/': 1.3, 'lib/': 1.2, 'tests/fixtures/': 0.5 },
+        extensions: { '.md': 0.7 }
+    },
+    doc: {
+        folders: { 'docs/': 1.5, 'plans/': 1.3 },
+        extensions: { '.md': 1.5, '.txt': 1.3 }
+    },
+    mixed: {} // identity preset; documents the no-op for symmetry
+};
+
+/**
+ * Compose per-call boost rules over server-side defaults. Per-call entries win
+ * on key collision so agents can override env-configured weights for a single
+ * query. Returns undefined when neither side contributes any rule.
+ * @internal
+ */
+function mergeBoostRules(defaults: BoostRules | undefined, perCall: BoostRules | undefined): BoostRules | undefined {
+    if (!defaults && !perCall) return undefined;
+    const folders = { ...(defaults?.folders), ...(perCall?.folders) };
+    const extensions = { ...(defaults?.extensions), ...(perCall?.extensions) };
+    const folderCount = Object.keys(folders).length;
+    const extCount = Object.keys(extensions).length;
+    if (folderCount === 0 && extCount === 0) return undefined;
+    return {
+        ...(folderCount > 0 && { folders }),
+        ...(extCount > 0 && { extensions })
+    };
+}
+
+/**
+ * Flatten a {@link BoostRules} into a stable list of `kind:key` rule
+ * identifiers for telemetry. Order is folders-then-extensions for log
+ * stability; consumers should treat the list as a set.
+ * Counterpart: appendBoostEvent in boost-log.ts persists these keys.
+ * @internal
+ */
+function collectBoostKeys(boosts: BoostRules): string[] {
+    const keys: string[] = [];
+    for (const k of Object.keys(boosts.folders ?? {})) keys.push(`folder:${k}`);
+    for (const k of Object.keys(boosts.extensions ?? {})) keys.push(`ext:${k}`);
+    return keys;
+}
+
+/**
+ * Re-rank semantic search results using multiplicative boost factors.
+ * Folder match uses longest-prefix-wins; extension match uses exact extname.
+ * Both compose multiplicatively. Sort is stable on ties (preserves RRF order).
+ * Returns a NEW array — caller's input is not mutated. Each output result
+ * carries `originalScore` and `boost` for debuggability when boosts fired.
+ * @internal
+ */
+function rerankWithBoosts(results: any[], boosts: BoostRules): any[] {
+    const folderKeys = Object.keys(boosts.folders ?? {}).sort((a, b) => b.length - a.length);
+    const extensionMap = boosts.extensions ?? {};
+
+    return results
+        .map((result, index) => {
+            let factor = 1;
+            for (const key of folderKeys) {
+                if (result.relativePath.startsWith(key)) {
+                    factor *= boosts.folders![key];
+                    break;
+                }
+            }
+            const ext = path.extname(result.relativePath);
+            if (ext && extensionMap[ext] !== undefined) {
+                factor *= extensionMap[ext];
+            }
+            return {
+                ...result,
+                originalScore: result.score,
+                score: result.score * factor,
+                boost: factor,
+                _rrfIndex: index
+            };
+        })
+        .sort((a, b) => b.score - a.score || a._rrfIndex - b._rrfIndex)
+        .map(({ _rrfIndex, ...rest }) => rest);
+}
 
 export class ToolHandlers {
     private context: Context;
@@ -20,10 +193,17 @@ export class ToolHandlers {
      * just-cleared collection (issue #199).
      */
     private indexingTasks: Map<string, { controller: AbortController; promise: Promise<void> }> = new Map();
+    /**
+     * Server-side default ranking boosts parsed from CLAUDE_CONTEXT_BOOSTS.
+     * Per-call `boosts` arg on search_code wins on key collision.
+     * Counterpart: parseBoostRulesFromEnv in config.ts.
+     */
+    private boostDefaults?: BoostRules;
 
-    constructor(context: Context, snapshotManager: SnapshotManager) {
+    constructor(context: Context, snapshotManager: SnapshotManager, boostDefaults?: BoostRules) {
         this.context = context;
         this.snapshotManager = snapshotManager;
+        this.boostDefaults = boostDefaults;
         this.currentWorkspace = process.cwd();
         console.log(`[WORKSPACE] Current workspace: ${this.currentWorkspace}`);
     }
@@ -645,8 +825,27 @@ export class ToolHandlers {
     }
 
     public async handleSearchCode(args: any) {
-        const { path: codebasePath, query, limit = 10, extensionFilter } = args;
+        const { path: codebasePath, query, limit = 10, extensionFilter, boosts: boostsArg, profile: profileArg } = args;
         const resultLimit = limit || 10;
+        // Resolve profile preset, rejecting unknown values rather than silently
+        // falling back — surprise routing on a typo is worse than an error.
+        let profileBoosts: BoostRules | undefined;
+        if (profileArg !== undefined && profileArg !== null) {
+            if (typeof profileArg !== 'string' || !(profileArg in BOOST_PROFILES)) {
+                const valid = Object.keys(BOOST_PROFILES).join(', ');
+                return {
+                    content: [{ type: 'text', text: `Error: Unknown profile '${profileArg}'. Valid choices: ${valid}.` }],
+                    isError: true
+                };
+            }
+            profileBoosts = BOOST_PROFILES[profileArg];
+        }
+        // Layered merge: env defaults < profile preset < per-call boosts.
+        // Counterpart: BOOST_PROFILES lookup table at module top.
+        const effectiveBoosts = mergeBoostRules(
+            mergeBoostRules(this.boostDefaults, profileBoosts),
+            validateBoostsArg(boostsArg)
+        );
 
         try {
             // Sync indexed codebases from cloud first
@@ -758,14 +957,52 @@ export class ToolHandlers {
                 filterExpr = `fileExtension in [${quoted}]`;
             }
 
+            // Path scope: when the requested path is a strict descendant of the matched
+            // indexed root, restrict results to that subtree. Without this, `path=` is
+            // only used to pick the parent collection — results bleed across the whole
+            // indexed tree (P3). Counterpart: chunks are stored with POSIX `relativePath`
+            // by the indexer in context.ts, so we normalize separators on Windows.
+            const pathScope = computePathScope(searchCodebasePath, absolutePath);
+            if (pathScope) {
+                const scopeExpr = `relativePath like "${escapeMilvusLike(pathScope)}/%"`;
+                filterExpr = filterExpr ? `(${filterExpr}) and (${scopeExpr})` : scopeExpr;
+                console.log(`[SEARCH] Scoping results to subdirectory: ${pathScope}/`);
+            }
+
             // Search in the specified codebase
-            const searchResults = await this.context.semanticSearch(
+            const rawResults = await this.context.semanticSearch(
                 searchCodebasePath,
                 query,
                 Math.min(resultLimit, 50),
                 0.3,
                 filterExpr
             );
+
+            // Re-rank with boost rules at the MCP boundary so Milvus's RRF stays
+            // pure. Boosts are presentation-tier (P4/P5) — they shape what the
+            // agent sees without polluting the core search API.
+            const rrfTopPath = (rawResults as any[])[0]?.relativePath;
+            const searchResults = effectiveBoosts ? rerankWithBoosts(rawResults as any[], effectiveBoosts) : rawResults;
+            if (effectiveBoosts && searchResults.length > 0) {
+                const top = searchResults[0] as any;
+                console.log(`[SEARCH] 🎚️  Boosts applied: top result boost=×${top.boost?.toFixed(2)}, rrf=${top.originalScore?.toFixed(3)} → adj=${top.score?.toFixed(3)}, path=${top.relativePath}`);
+                // Telemetry (Q5) — fire-and-forget; never blocks the search
+                // path. Counterpart: ~/.context/boost-events.jsonl, summarized
+                // by handleBoostStats / boost_stats MCP tool.
+                appendBoostEvent({
+                    ts: new Date().toISOString(),
+                    query,
+                    scope: pathScope,
+                    boostKeys: collectBoostKeys(effectiveBoosts),
+                    top: {
+                        path: top.relativePath,
+                        boost: top.boost ?? 1,
+                        rrf: top.originalScore ?? top.score,
+                        adj: top.score
+                    },
+                    shifted: !!rrfTopPath && rrfTopPath !== top.relativePath
+                });
+            }
 
             console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
 
@@ -784,7 +1021,9 @@ export class ToolHandlers {
 
                 let noResultsMessage = `No results found for query: "${query}" in codebase '${searchCodebasePath}'`;
                 if (searchCodebasePath !== absolutePath) {
-                    noResultsMessage += `\nRequested path '${absolutePath}' is covered by indexed codebase '${searchCodebasePath}'.`;
+                    noResultsMessage += pathScope
+                        ? `\nResults scoped to subdirectory '${pathScope}/' within indexed codebase '${searchCodebasePath}'.`
+                        : `\nRequested path '${absolutePath}' is covered by indexed codebase '${searchCodebasePath}'.`;
                 }
                 if (isIndexing) {
                     noResultsMessage += `\n\nNote: This codebase is still being indexed. Try searching again after indexing completes, or the query may not match any indexed content.`;
@@ -802,16 +1041,22 @@ export class ToolHandlers {
                 const location = `${result.relativePath}:${result.startLine}-${result.endLine}`;
                 const context = truncateContent(result.content, 5000);
                 const codebaseInfo = path.basename(searchCodebasePath);
+                const boostLine = (result.boost !== undefined && result.boost !== 1)
+                    ? `   Boost: ×${result.boost.toFixed(2)} (rrf=${result.originalScore.toFixed(3)} → adj=${result.score.toFixed(3)})\n`
+                    : '';
 
                 return `${index + 1}. Code snippet (${result.language}) [${codebaseInfo}]\n` +
                     `   Location: ${location}\n` +
                     `   Rank: ${index + 1}\n` +
+                    boostLine +
                     `   Context: \n\`\`\`${result.language}\n${context}\n\`\`\`\n`;
             }).join('\n');
 
             let resultMessage = `Found ${searchResults.length} results for query: "${query}" in codebase '${searchCodebasePath}'${indexingStatusMessage}`;
             if (searchCodebasePath !== absolutePath) {
-                resultMessage += `\nRequested path '${absolutePath}' is covered by indexed codebase '${searchCodebasePath}'.`;
+                resultMessage += pathScope
+                    ? `\nResults scoped to subdirectory '${pathScope}/' within indexed codebase '${searchCodebasePath}'.`
+                    : `\nRequested path '${absolutePath}' is covered by indexed codebase '${searchCodebasePath}'.`;
             }
             resultMessage += `\n\n${formattedResults}`;
 
@@ -989,6 +1234,115 @@ export class ToolHandlers {
         }
     }
 
+    /**
+     * Resync a codebase's index by composing clear + force re-index. Use after
+     * `get_indexing_status` flags a stale snapshot (live Milvus chunk count
+     * differs from snapshot's stored count) so the snapshot and the vector DB
+     * agree again. Cancels any in-flight indexing via `handleClearIndex`'s
+     * AbortController plumbing before starting the new index.
+     * Counterpart: stale-snapshot warning emitted by `buildLiveDiagnostics`.
+     * Failure modes: clear failure short-circuits with the clear error; index
+     * failure surfaces normally and the snapshot is left in `indexfailed` state
+     * so the agent can retry.
+     * @stable — exposed as the `resync_index` MCP tool.
+     */
+    public async handleResyncIndex(args: any) {
+        const { path: codebasePath } = args;
+        console.log(`[RESYNC] Starting resync for: ${codebasePath}`);
+        const clearResult = await this.handleClearIndex({ path: codebasePath });
+        if (clearResult.isError) {
+            console.error(`[RESYNC] Clear step failed for ${codebasePath} — aborting resync`);
+            return clearResult;
+        }
+        console.log(`[RESYNC] Clear succeeded, starting fresh index for: ${codebasePath}`);
+        return await this.handleIndexCodebase({ path: codebasePath, force: true });
+    }
+
+    /**
+     * Render boost telemetry as a human-readable summary for the `boost_stats`
+     * MCP tool (Q5). Reads `~/.context/boost-events.jsonl` via boost-log helpers
+     * and aggregates: total events, per-rule fire count, rank-shift rate, top
+     * boosted paths. Returns an "empty" summary when no log exists yet — never
+     * an error, since a fresh install has no telemetry by definition.
+     * Counterpart: appendBoostEvent in boost-log.ts writes the source data.
+     * @stable — exposed as the `boost_stats` MCP tool.
+     */
+    public async handleBoostStats(_args: any) {
+        const summary = summarizeBoostEvents();
+        if (summary.totalEvents === 0) {
+            return {
+                content: [{ type: 'text', text: 'No boost events recorded yet. Run search_code with `profile` or `boosts` to populate ~/.context/boost-events.jsonl.' }]
+            };
+        }
+        const ruleLines = Object.entries(summary.perRuleFireCount)
+            .sort((a, b) => b[1] - a[1])
+            .map(([rule, count]) => `   ${rule}: ${count}`)
+            .join('\n');
+        const pathLines = summary.topBoostedPaths
+            .map((entry, i) => `   ${i + 1}. ${entry.path} (${entry.count})`)
+            .join('\n');
+        const text = [
+            `📊 Boost telemetry summary`,
+            `   totalEvents=${summary.totalEvents}`,
+            `   shiftedRate=${(summary.shiftedRate * 100).toFixed(1)}%  (rank-1 changed in ${summary.shiftedCount}/${summary.totalEvents} queries)`,
+            summary.earliestTs ? `   firstSeen=${summary.earliestTs}` : '',
+            summary.latestTs ? `   lastSeen=${summary.latestTs}` : '',
+            ``,
+            `Per-rule fire counts:`,
+            ruleLines || '   (none)',
+            ``,
+            `Top boosted result paths:`,
+            pathLines || '   (none)'
+        ].filter(Boolean).join('\n');
+        return { content: [{ type: 'text', text }] };
+    }
+
+    /**
+     * Build the live-diagnostics block appended to `get_indexing_status` (P7).
+     * Reads Milvus row count and freshness env vars on every call so the
+     * report reflects current state, not server-startup state. Failures on the
+     * Milvus side fall through to a snapshot-only block — agents must still
+     * get a usable response when the vector DB is unreachable.
+     * Counterpart: setCodebaseIndexed in snapshot.ts persists `indexStatus`
+     * which we surface here as the cap-fired signal.
+     * @internal
+     */
+    private async buildLiveDiagnostics(codebasePath: string, info: any): Promise<string> {
+        const lines: string[] = ['', '📊 Diagnostics:'];
+        lines.push(`   chunkLimit=${CHUNK_LIMIT}`);
+
+        let liveChunkCount: number | 'unavailable' = 'unavailable';
+        try {
+            const collectionName = this.context.getCollectionName(codebasePath);
+            const hasCollection = await this.context.getVectorDatabase().hasCollection(collectionName);
+            if (hasCollection) {
+                const rowCount = await this.context.getVectorDatabase().getCollectionRowCount(collectionName);
+                if (rowCount >= 0) liveChunkCount = rowCount;
+            }
+        } catch (error) {
+            console.warn(`[STATUS] Live chunk count unavailable for '${codebasePath}':`, error);
+        }
+        lines.push(`   liveChunkCount=${liveChunkCount}`);
+
+        const snapshotChunks = info && 'totalChunks' in info ? info.totalChunks : undefined;
+        if (typeof snapshotChunks === 'number' && typeof liveChunkCount === 'number' && snapshotChunks !== liveChunkCount) {
+            lines.push(`   ⚠️  snapshot=${snapshotChunks} differs from Milvus=${liveChunkCount} — snapshot may be stale`);
+        }
+
+        const capFired = info && 'indexStatus' in info && info.indexStatus === 'limit_reached';
+        lines.push(`   capFired=${capFired ? 'yes' : 'no'}`);
+
+        // Sync env vars: read each call so toggling them doesn't require a restart.
+        const watcherDisabled = (envManager.get('CLAUDE_CONTEXT_TRIGGER_WATCHER') ?? 'true').toLowerCase() === 'false';
+        const backgroundDisabled = (envManager.get('CLAUDE_CONTEXT_BACKGROUND_SYNC') ?? 'true').toLowerCase() === 'false';
+        const intervalMs = Number(envManager.get('CLAUDE_CONTEXT_SYNC_INTERVAL_MS') ?? 300000);
+        lines.push(`   fileWatcherEnabled=${!watcherDisabled}`);
+        lines.push(`   backgroundSyncEnabled=${!backgroundDisabled}`);
+        lines.push(`   backgroundSyncIntervalMs=${Number.isFinite(intervalMs) ? intervalMs : 300000}`);
+
+        return lines.join('\n');
+    }
+
     public async handleGetIndexingStatus(args: any) {
         const { path: codebasePath } = args;
 
@@ -1087,10 +1441,12 @@ export class ToolHandlers {
                 ? `\nRequested path '${absolutePath}' is covered by tracked codebase '${statusCodebasePath}'.`
                 : '';
 
+            const diagnostics = await this.buildLiveDiagnostics(statusCodebasePath, info);
+
             return {
                 content: [{
                     type: "text",
-                    text: statusMessage + pathInfo + matchedPathInfo
+                    text: statusMessage + pathInfo + matchedPathInfo + diagnostics
                 }]
             };
 
