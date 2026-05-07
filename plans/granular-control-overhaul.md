@@ -1,6 +1,6 @@
 ---
 title: claude-context MCP — granular control overhaul (P2/P3/P4/P5/P7)
-status: in-progress
+status: completed
 created: 2026-05-06
 ---
 
@@ -113,33 +113,33 @@ No changes to `vectordb/milvus-vectordb.ts`, `splitter/`, `embedding/`, or exten
 ## Acceptance Criteria
 
 P3 — path scoping:
-- [ ] `search_code path=<indexed_root>/<subdir> query=...` returns ONLY hits whose `relativePath` starts with `<subdir>/`.
-- [ ] `search_code path=<indexed_root> query=...` (no subscope) still returns full-tree results — no regression.
-- [ ] Path with special chars (spaces, dashes) is correctly escaped in the Milvus filter expression.
-- [ ] Notice text on subscope queries says the result set was scoped to the subdir, not just "covered by" the parent.
+- [x] `search_code path=<indexed_root>/<subdir> query=...` returns ONLY hits whose `relativePath` starts with `<subdir>/`.
+- [x] `search_code path=<indexed_root> query=...` (no subscope) still returns full-tree results — no regression.
+- [x] Path with special chars (spaces, dashes) is correctly escaped in the Milvus filter expression.
+- [x] Notice text on subscope queries says the result set was scoped to the subdir, not just "covered by" the parent.
 
 P4/P5 — boosts:
-- [ ] `search_code` accepts a `boosts` arg with optional `folders` and `extensions` maps; omitted fields behave as the no-boost baseline.
-- [ ] When boosts apply, results are re-sorted by adjusted score; each result includes both `score` (adjusted) and `originalScore`.
-- [ ] Folder boosts use longest-prefix match; extension boosts use exact match on `path.extname`.
-- [ ] `CLAUDE_CONTEXT_BOOSTS=folder:plans/=1.5,ext:.md=1.2` works as a server-side default and is overridden by per-call `boosts`.
-- [ ] Malformed env entries log a warning and are skipped — server still starts.
+- [x] `search_code` accepts a `boosts` arg with optional `folders` and `extensions` maps; omitted fields behave as the no-boost baseline.
+- [x] When boosts apply, results are re-sorted by adjusted score; each result includes both `score` (adjusted) and `originalScore`.
+- [x] Folder boosts use longest-prefix match; extension boosts use exact match on `path.extname`.
+- [x] `CLAUDE_CONTEXT_BOOSTS=folder:plans/=1.5,ext:.md=1.2` works as a server-side default and is overridden by per-call `boosts`.
+- [x] Malformed env entries log a warning and are skipped — server still starts.
 
 P7 — diagnostics:
-- [ ] `get_indexing_status` returns `liveChunkCount`, `chunkLimit`, `chunksDroppedAtCap`, `lastSyncAt`, `fileWatcherEnabled`, `backgroundSyncIntervalMs` in addition to existing fields.
-- [ ] If the live Milvus call fails, response falls back to snapshot data and includes `liveFetchError` — request does not throw.
-- [ ] Snapshot version bumps to v3; v2 snapshots still load (backward-compat read path covered).
-- [ ] When indexing hits `CHUNK_LIMIT`, the dropped count is persisted to the snapshot and surfaced on next status call.
+- [x] `get_indexing_status` returns `liveChunkCount`, `chunkLimit`, `chunksDroppedAtCap`, `lastSyncAt`, `fileWatcherEnabled`, `backgroundSyncIntervalMs` in addition to existing fields.
+- [x] If the live Milvus call fails, response falls back to snapshot data and includes `liveFetchError` — request does not throw.
+- [x] Snapshot version bumps to v3; v2 snapshots still load (backward-compat read path covered).
+- [x] When indexing hits `CHUNK_LIMIT`, the dropped count is persisted to the snapshot and surfaced on next status call.
 
 P2 — investigation:
-- [ ] After Patch 3 ships, run `get_indexing_status` against the user's `~/.claude` index and record `liveChunkCount` vs `totalChunks` vs `chunksDroppedAtCap`.
-- [ ] Document the finding (stale snapshot vs. real cap vs. hidden cap) in this file's Progress section.
-- [ ] If a real cap is fired, ship a follow-up making it env-configurable. If not, no further code change.
+- [x] After Patch 3 ships, run `get_indexing_status` against the user's `~/.claude` index and record `liveChunkCount` vs `totalChunks` vs `chunksDroppedAtCap`.
+- [x] Document the finding (stale snapshot vs. real cap vs. hidden cap) in this file's Progress section.
+- [x] If a real cap is fired, ship a follow-up making it env-configurable. If not, no further code change.
 
 Build & integration:
-- [ ] `pnpm install && pnpm run build:core && pnpm run build:mcp` succeeds with zero TypeScript errors.
-- [ ] Existing reference query (no subscope, no boosts) returns the same top-3 hits as before changes.
-- [ ] All four MCP tools (`index_codebase`, `search_code`, `clear_index`, `get_indexing_status`) still register and respond after restart.
+- [x] `pnpm install && pnpm run build:core && pnpm run build:mcp` succeeds with zero TypeScript errors.
+- [x] Existing reference query (no subscope, no boosts) returns the same top-3 hits as before changes.
+- [x] All four MCP tools (`index_codebase`, `search_code`, `clear_index`, `get_indexing_status`) still register and respond after restart.
 
 ## Verification
 
@@ -263,36 +263,36 @@ New file: `packages/mcp/src/boost-log.ts` (~80 lines).
 ## Acceptance Criteria (Iteration 2)
 
 Q1:
-- [ ] README "Recommended Models" lists at least 3 Ollama options with tradeoffs.
-- [ ] `--help` shows `OLLAMA_MODEL=jina-embeddings-v2-base-code` as a recommended choice.
-- [ ] Migration steps (model switch → resync) documented.
+- [x] README "Recommended Models" lists at least 3 Ollama options with tradeoffs.
+- [x] `--help` shows `OLLAMA_MODEL=jina-embeddings-v2-base-code` as a recommended choice.
+- [x] Migration steps (model switch → resync) documented.
 
 Q2:
-- [ ] `CLAUDE_CONTEXT_RRF_K` env honored when set; defaults to 60 when unset.
-- [ ] Invalid env value (non-integer, ≤ 0) → log warning, fall back to 60.
-- [ ] `--help` documents the env var.
+- [x] `CLAUDE_CONTEXT_RRF_K` env honored when set; defaults to 60 when unset.
+- [x] Invalid env value (non-integer, ≤ 0) → log warning, fall back to 60.
+- [x] `--help` documents the env var.
 
 Q3:
-- [ ] `search_code` accepts `profile` enum: plan|code|doc|mixed.
-- [ ] Profile boosts compose under env defaults and per-call boosts per documented precedence.
-- [ ] Unknown profile string → MCP error listing valid choices.
-- [ ] Tool schema description explains when each profile fits.
+- [x] `search_code` accepts `profile` enum: plan|code|doc|mixed.
+- [x] Profile boosts compose under env defaults and per-call boosts per documented precedence.
+- [x] Unknown profile string → MCP error listing valid choices.
+- [x] Tool schema description explains when each profile fits.
 
 Q4:
-- [ ] `tools/list` includes `resync_index` with absolute-path arg.
-- [ ] After resync on a stale codebase, `get_indexing_status` shows `liveChunkCount === totalChunks` (warning gone).
-- [ ] In-flight indexing aborts cleanly before resync starts (no double-write).
+- [x] `tools/list` includes `resync_index` with absolute-path arg.
+- [x] After resync on a stale codebase, `get_indexing_status` shows `liveChunkCount === totalChunks` (warning gone).
+- [x] In-flight indexing aborts cleanly before resync starts (no double-write).
 
 Q5:
-- [ ] Each boost-applied `search_code` call appends one JSONL line to `~/.context/boost-events.jsonl`.
-- [ ] Log file caps at 5 MB; oldest entries pruned automatically.
-- [ ] `boost_stats` returns total searches, per-rule fire count, rank-shift rate, top 5 boosted paths.
-- [ ] Queries truncated to 200 chars; never log file content.
-- [ ] When boosts not applied, no log line written (silent fast path).
+- [x] Each boost-applied `search_code` call appends one JSONL line to `~/.context/boost-events.jsonl`.
+- [x] Log file caps at 5 MB; oldest entries pruned automatically.
+- [x] `boost_stats` returns total searches, per-rule fire count, rank-shift rate, top 5 boosted paths.
+- [x] Queries truncated to 200 chars; never log file content.
+- [x] When boosts not applied, no log line written (silent fast path).
 
 Build:
-- [ ] `pnpm typecheck && pnpm run build` succeed with zero TS errors.
-- [ ] All five tools (index, search, clear, status, resync) plus boost_stats register and respond.
+- [x] `pnpm typecheck && pnpm run build` succeed with zero TS errors.
+- [x] All five tools (index, search, clear, status, resync) plus boost_stats register and respond.
 
 ## Verification (Iteration 2)
 
