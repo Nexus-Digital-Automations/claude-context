@@ -125,6 +125,14 @@ This tool is versatile and can be used before completing various tasks to retrie
 - If the codebase is not indexed, this tool will return a clear error message indicating that indexing is required first.
 - You can then use the index_codebase tool to index the codebase before searching again.
 - When boosts are applied, each result's output includes a \`Boost: ×N.NN (rrf=... → adj=...)\` line for transparency.
+
+⛔ **When NOT to use search_code** (use grep / find / Read instead):
+- **Filename filtering**: \`find … | grep …\`, \`find -not -path …\`, or \`find … | xargs grep\`. \`find\` emits paths; the downstream grep filters paths, never file contents — search_code can't replace that.
+- **Single-file content scans**: \`grep "pat" path/to/file.py\` against one named file is targeted I/O. Read the file or run grep — the index round-trip adds latency without value.
+- **Off-project / unindexed paths**: anything outside an indexed root (\`/etc\`, \`/tmp\`, sibling repos that haven't been indexed). Use grep directly.
+- **Exact opaque tokens you already located**: UUIDs, SHAs, error codes, version strings in a known file. \`grep -F\` is precise; semantic ranking just adds noise.
+
+For everything else — concept queries, cross-file pattern discovery, "where is X implemented", architecture exploration — search_code is the right tool.
 `;
 
         // Define available tools
