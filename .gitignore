@@ -69,3 +69,6 @@ repos
 
 evaluation/retrieval_results*
 .venv/
+
+# Embedded reference clone (kept locally for porting; will be removed)
+/docs/codegraph/
