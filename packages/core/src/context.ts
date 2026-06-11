@@ -1190,10 +1190,22 @@ export class Context {
             const entries = await fs.promises.readdir(codebasePath, { withFileTypes: true });
             const ignoreFiles: string[] = [];
 
+            // Only load RECOGNIZED ignore files. Matching any `.*ignore` file is
+            // too greedy: tool-specific files that merely end in "ignore"
+            // (e.g. .critical-paths-ignore containing `**/*`, or .security-ignore
+            // with `[tool:...]` lines) are NOT index-ignore files, and applying
+            // their patterns silently excludes the whole codebase from indexing.
+            const RECOGNIZED_IGNORE_FILES = new Set([
+                '.gitignore',
+                '.contextignore',
+                '.cursorignore',
+                '.codeiumignore',
+                '.aiignore',
+                '.indexignore',
+            ]);
+
             for (const entry of entries) {
-                if (entry.isFile() &&
-                    entry.name.startsWith('.') &&
-                    entry.name.endsWith('ignore')) {
+                if (entry.isFile() && RECOGNIZED_IGNORE_FILES.has(entry.name)) {
                     ignoreFiles.push(path.join(codebasePath, entry.name));
                 }
             }
