@@ -468,22 +468,44 @@ export class ToolHandlers {
                 }
             }
 
+            // Codebases with an in-flight index must NOT be "recovered" here. An
+            // actively-indexing codebase has snapshot status 'indexing', so it is
+            // absent from `localCodebases` (which only holds 'indexed' entries),
+            // and its Milvus collection is mid-populate. Recovering it would call
+            // queryCollectionStats() and stamp a premature 'completed' using the
+            // current PARTIAL rowCount for BOTH indexedFiles and totalChunks —
+            // clobbering live progress and surfacing fabricated, always-equal
+            // "N files, N chunks" while embedding is still running (the exact
+            // cause of get_indexing_status reporting "completed" mid-index).
+            // Guard with the live task map (authoritative for this server) plus
+            // the snapshot's 'indexing' set (covers a task owned by another
+            // process or carried across a restart).
+            const indexingInFlight = new Set<string>(
+                [
+                    ...this.indexingTasks.keys(),
+                    ...this.snapshotManager.getIndexingCodebases(),
+                ].map(p => path.resolve(p))
+            );
+
             // Add cloud codebases that are missing from local snapshot (recovery).
             // Query Milvus for the real row count — if unknown/empty, skip the write
             // so we don't persist a poisoning 0/0+completed entry (Issue #295).
             for (const cloudCodebase of cloudCodebases) {
-                if (!localCodebases.has(cloudCodebase)) {
-                    const stats = await this.queryCollectionStats(cloudCodebase);
-                    if (stats) {
-                        this.snapshotManager.setCodebaseIndexed(cloudCodebase, {
-                            ...stats,
-                            status: 'completed' as const
-                        });
-                        hasChanges = true;
-                        console.log(`[SYNC-CLOUD] ➕ Recovered codebase from cloud: ${cloudCodebase} (rows=${stats.totalChunks})`);
-                    } else {
-                        console.log(`[SYNC-CLOUD] ⏭️  Skipped recovery for ${cloudCodebase} (row count unknown or zero)`);
-                    }
+                if (localCodebases.has(cloudCodebase)) continue;
+                if (indexingInFlight.has(path.resolve(cloudCodebase))) {
+                    console.log(`[SYNC-CLOUD] ⏭️  Skipped recovery for ${cloudCodebase} (indexing in progress — preserving live state)`);
+                    continue;
+                }
+                const stats = await this.queryCollectionStats(cloudCodebase);
+                if (stats) {
+                    this.snapshotManager.setCodebaseIndexed(cloudCodebase, {
+                        ...stats,
+                        status: 'completed' as const
+                    });
+                    hasChanges = true;
+                    console.log(`[SYNC-CLOUD] ➕ Recovered codebase from cloud: ${cloudCodebase} (rows=${stats.totalChunks})`);
+                } else {
+                    console.log(`[SYNC-CLOUD] ⏭️  Skipped recovery for ${cloudCodebase} (row count unknown or zero)`);
                 }
             }
 
@@ -1380,9 +1402,20 @@ export class ToolHandlers {
             const status = this.snapshotManager.getCodebaseStatus(statusCodebasePath);
             const info = this.snapshotManager.getCodebaseInfo(statusCodebasePath);
 
+            // A live in-process indexing task is authoritative over the snapshot.
+            // Recovery/sync/validation paths can momentarily stamp an actively-
+            // indexing entry as 'indexed'; while our background task is still
+            // embedding, the honest status is 'indexing'. The task map self-clears
+            // on completion (startBackgroundIndexing's .finally), so this is true
+            // only while work is genuinely in flight.
+            const effectiveStatus =
+                (this.indexingTasks.has(statusCodebasePath) || this.indexingTasks.has(absolutePath))
+                    ? 'indexing'
+                    : status;
+
             let statusMessage = '';
 
-            switch (status) {
+            switch (effectiveStatus) {
                 case 'indexed':
                     if (info && 'indexedFiles' in info) {
                         const indexedInfo = info as any;
