@@ -7,8 +7,8 @@
         "build": "webpack --mode=production",
         "dev": "webpack --mode=development --watch",
         "clean": "rimraf dist",
-        "lint": "eslint src --ext .ts,.tsx",
-        "lint:fix": "eslint src --ext .ts,.tsx --fix",
+        "lint": "eslint src",
+        "lint:fix": "eslint src --fix",
         "typecheck": "tsc --noEmit",
         "build:milvus": "echo 'build:milvus script not implemented'"
     },

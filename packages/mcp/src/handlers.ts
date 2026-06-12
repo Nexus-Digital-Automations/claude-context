@@ -1,6 +1,5 @@
 import * as fs from "fs";
 import * as path from "path";
-import * as crypto from "crypto";
 import { CHUNK_LIMIT, Context, COLLECTION_LIMIT_MESSAGE, envManager, FileSynchronizer, IndexAbortError } from "@zilliz/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import type { BoostRules, CodebaseIndexOptions, RequestSplitterType } from "./config.js";

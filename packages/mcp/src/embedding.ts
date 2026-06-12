@@ -6,7 +6,7 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
     console.log(`[EMBEDDING] Creating ${config.embeddingProvider} embedding instance...`);
 
     switch (config.embeddingProvider) {
-        case 'OpenAI':
+        case 'OpenAI': {
             if (!config.openaiApiKey) {
                 console.error(`[EMBEDDING] ❌ OpenAI API key is required but not provided`);
                 throw new Error('OPENAI_API_KEY is required for OpenAI embedding provider');
@@ -19,8 +19,9 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
             });
             console.log(`[EMBEDDING] ✅ OpenAI embedding instance created successfully`);
             return openaiEmbedding;
+        }
 
-        case 'VoyageAI':
+        case 'VoyageAI': {
             if (!config.voyageaiApiKey) {
                 console.error(`[EMBEDDING] ❌ VoyageAI API key is required but not provided`);
                 throw new Error('VOYAGEAI_API_KEY is required for VoyageAI embedding provider');
@@ -32,8 +33,9 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
             });
             console.log(`[EMBEDDING] ✅ VoyageAI embedding instance created successfully`);
             return voyageEmbedding;
+        }
 
-        case 'Gemini':
+        case 'Gemini': {
             if (!config.geminiApiKey) {
                 console.error(`[EMBEDDING] ❌ Gemini API key is required but not provided`);
                 throw new Error('GEMINI_API_KEY is required for Gemini embedding provider');
@@ -46,8 +48,9 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
             });
             console.log(`[EMBEDDING] ✅ Gemini embedding instance created successfully`);
             return geminiEmbedding;
+        }
 
-        case 'OpenRouter':
+        case 'OpenRouter': {
             if (!config.openrouterApiKey) {
                 console.error(`[EMBEDDING] ❌ OpenRouter API key is required but not provided`);
                 throw new Error('OPENROUTER_API_KEY is required for OpenRouter embedding provider');
@@ -61,8 +64,9 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
             });
             console.log(`[EMBEDDING] ✅ OpenRouter embedding instance created successfully`);
             return openrouterEmbedding;
+        }
 
-        case 'Ollama':
+        case 'Ollama': {
             const ollamaHost = config.ollamaHost || 'http://127.0.0.1:11434';
             console.log(`[EMBEDDING] 🔧 Configuring Ollama with model: ${config.embeddingModel}, host: ${ollamaHost}${config.ollamaDimension ? `, dimension: ${config.ollamaDimension}` : ''}`);
             const ollamaEmbedding = new OllamaEmbedding({
@@ -72,6 +76,7 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
             });
             console.log(`[EMBEDDING] ✅ Ollama embedding instance created successfully`);
             return ollamaEmbedding;
+        }
 
         default:
             console.error(`[EMBEDDING] ❌ Unsupported embedding provider: ${config.embeddingProvider}`);

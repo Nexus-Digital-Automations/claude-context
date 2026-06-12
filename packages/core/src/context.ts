@@ -13,7 +13,6 @@ import {
     VectorDocument,
     VectorSearchResult,
     HybridSearchRequest,
-    HybridSearchOptions,
     HybridSearchResult
 } from './vectordb';
 import { SemanticSearchResult } from './types';
@@ -566,7 +565,7 @@ export class Context {
         if (isHybrid === true) {
             try {
                 // Check collection stats to see if it has data
-                const stats = await this.vectorDatabase.query(collectionName, '', ['id'], 1);
+                await this.vectorDatabase.query(collectionName, '', ['id'], 1);
                 console.log(`[Context] 🔍 Collection '${collectionName}' exists and appears to have data`);
             } catch (error) {
                 console.log(`[Context] ⚠️  Collection '${collectionName}' exists but may be empty or not properly indexed:`, error);
@@ -816,7 +815,6 @@ export class Context {
         console.log(`[Context] 🔍 Detecting embedding dimension for ${this.embedding.getProvider()} provider...`);
         const dimension = await this.embedding.detectDimension();
         console.log(`[Context] 📏 Detected dimension: ${dimension} for ${this.embedding.getProvider()}`);
-        const dirName = path.basename(codebasePath);
 
         if (isHybrid === true) {
             await this.vectorDatabase.createHybridCollection(collectionName, dimension, `codebasePath:${codebasePath}`);
@@ -1138,7 +1136,7 @@ export class Context {
      */
     private async loadIgnorePatterns(codebasePath: string, additionalIgnorePatterns: string[] = []): Promise<string[]> {
         try {
-            let fileBasedPatterns: string[] = [];
+            const fileBasedPatterns: string[] = [];
 
             // Load all .xxxignore files in codebase directory
             const ignoreFiles = await this.findIgnoreFiles(codebasePath);
@@ -1230,7 +1228,7 @@ export class Context {
             const homeDir = require('os').homedir();
             const globalIgnorePath = path.join(homeDir, '.context', '.contextignore');
             return await this.loadIgnoreFile(globalIgnorePath, 'global .contextignore');
-        } catch (error) {
+        } catch {
             // Global ignore file is optional, don't log warnings
             return [];
         }
@@ -1256,7 +1254,7 @@ export class Context {
                 console.log(`📄 ${fileName} file found but no valid patterns detected`);
                 return [];
             }
-        } catch (error) {
+        } catch {
             if (fileName.includes('global')) {
                 console.log(`📄 No ${fileName} file found`);
             }

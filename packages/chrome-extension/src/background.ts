@@ -3,31 +3,14 @@
 
 import { ChromeMilvusAdapter, CodeChunk } from './milvus/chromeMilvusAdapter';
 import { MilvusConfigManager } from './config/milvusConfig';
-import { IndexedRepoManager, IndexedRepository } from './storage/indexedRepoManager';
+import { IndexedRepoManager } from './storage/indexedRepoManager';
 
 export { };
 
 const EMBEDDING_DIM = 1536;
 const EMBEDDING_BATCH_SIZE = 100;
-const MAX_TOKENS_PER_BATCH = 250000;
-const MAX_CHUNKS_PER_BATCH = 100;
 
-// Cosine similarity function
-function cosSim(a: number[], b: number[]): number {
-    let dot = 0;
-    let normA = 0;
-    let normB = 0;
-    const len = Math.min(a.length, b.length);
-    for (let i = 0; i < len; i++) {
-        dot += a[i] * b[i];
-        normA += a[i] * a[i];
-        normB += b[i] * b[i];
-    }
-    if (normA === 0 || normB === 0) {
-        return 0;
-    }
-    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
-}
+// Cosine similarity function removed (unused)
 
 class EmbeddingModel {
     private static config: { apiKey: string; model: string } | null = null;
@@ -72,7 +55,7 @@ class EmbeddingModel {
         return results[0];
     }
 
-    static async getInstance(_progress_callback: Function | undefined = undefined): Promise<(input: string | string[], options?: any) => Promise<{ data: number[] }>> {
+    static async getInstance(_progress_callback: ((...args: any[]) => void) | undefined = undefined): Promise<(input: string | string[], options?: any) => Promise<{ data: number[] }>> {
         return async (input: string | string[], _opts: any = {}): Promise<{ data: number[] }> => {
             if (Array.isArray(input)) {
                 const embeddings = await this.embedBatch(input);
@@ -161,7 +144,7 @@ class MilvusVectorDB {
 }
 
 // Code splitting functionality - using same parameters as VSCode extension
-function splitCode(content: string, language: string = '', chunkSize: number = 1000, chunkOverlap: number = 200): { content: string; startLine: number; endLine: number }[] {
+function splitCode(content: string, _language: string = '', chunkSize: number = 1000, chunkOverlap: number = 200): { content: string; startLine: number; endLine: number }[] {
     const lines = content.split('\n');
     const chunks: { content: string; startLine: number; endLine: number }[] = [];
 
@@ -400,12 +383,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 });
 
-async function handleTestMilvusConnection(sendResponse: Function) {
+async function handleTestMilvusConnection(sendResponse: (response?: any) => void) {
     try {
         console.log('Testing Milvus connection...');
 
         const adapter = new ChromeMilvusAdapter('test_connection');
-        const connected = await adapter.testConnection();
+        await adapter.testConnection();
 
         console.log('Milvus connection test completed successfully');
         sendResponse({ success: true, connected: true });
@@ -438,7 +421,7 @@ async function handleTestMilvusConnection(sendResponse: Function) {
     }
 }
 
-async function handleIndexRepo(request: any, sendResponse: Function) {
+async function handleIndexRepo(request: any, sendResponse: (response?: any) => void) {
     try {
         const { owner, repo } = request;
         const repoId = `${owner}/${repo}`;
@@ -620,7 +603,7 @@ async function processChunkBatch(chunks: CodeChunk[], vectorDB: MilvusVectorDB):
     await vectorDB.addChunks(chunksWithEmbeddings);
 }
 
-async function handleSearchCode(request: any, sendResponse: Function) {
+async function handleSearchCode(request: any, sendResponse: (response?: any) => void) {
     try {
         const { query, owner, repo } = request;
         const repoId = `${owner}/${repo}`;
@@ -647,7 +630,7 @@ async function handleSearchCode(request: any, sendResponse: Function) {
     }
 }
 
-async function handleClearIndex(request: any, sendResponse: Function) {
+async function handleClearIndex(request: any, sendResponse: (response?: any) => void) {
     try {
         const { owner, repo } = request;
         const repoId = `${owner}/${repo}`;
@@ -668,7 +651,7 @@ async function handleClearIndex(request: any, sendResponse: Function) {
     }
 }
 
-async function handleCheckIndexStatus(request: any, sendResponse: Function) {
+async function handleCheckIndexStatus(request: any, sendResponse: (response?: any) => void) {
     try {
         const { owner, repo } = request;
         const repoId = `${owner}/${repo}`;
@@ -687,7 +670,7 @@ async function handleCheckIndexStatus(request: any, sendResponse: Function) {
                     indexInfo: indexedRepo,
                     stats
                 });
-            } catch (milvusError) {
+            } catch {
                 await IndexedRepoManager.removeIndexedRepo(repoId);
                 sendResponse({
                     success: true,
@@ -710,7 +693,7 @@ async function handleCheckIndexStatus(request: any, sendResponse: Function) {
     }
 }
 
-async function handleGetIndexedRepos(sendResponse: Function) {
+async function handleGetIndexedRepos(sendResponse: (response?: any) => void) {
     try {
         const repos = await IndexedRepoManager.getRecentlyIndexedRepos(20);
         sendResponse({
